@@ -115,6 +115,8 @@ def integrate(temporal_scheme, u0, t0, tf, f, dt, **kwargs):
 
     return trajectory, times
 
+
+# TO BE REMOVED ONCE OTHER MILESTONES ARE ADJUSTED FOR NEW ORGANIZATION SCHEME
 def get_numerical_jacobian(f, u, t, epsilon=1e-8, **kwargs):
     """
     Computes Jacobian J = dF/dU numerically via central finite differences.
@@ -140,3 +142,128 @@ def get_numerical_jacobian(f, u, t, epsilon=1e-8, **kwargs):
         J[:, i] = (f_plus - f_minus) / (2 * epsilon)
         
     return J
+
+# ==========================================
+# 5. EMBEDDED RUNGE-KUTTA (ADAPTIVE)
+# ==========================================
+
+def get_tableau(name):
+
+    if name == "Bogacki-Shampine":
+        #BS3(2) - Order 3 with embedded Order 2
+        order = 3
+        
+        # Nodes (Time steps)
+        c = np.array([0, 1/2, 3/4, 1])
+        
+        # The Runge-Kutta Matrix (A)
+        a = np.zeros((4, 4))
+        a[1, 0] = 1/2
+        a[2, 1] = 3/4
+        a[3, 0] = 2/9
+        a[3, 1] = 1/3
+        a[3, 2] = 4/9
+        
+        # Weights for the High-Order (3rd) solution
+        b = np.array([2/9, 1/3, 4/9, 0])
+        
+        # Weights for the Low-Order (2nd) solution (for error check)
+        bs = np.array([7/24, 1/4, 1/3, 1/8])
+    elif name == "Dormand-Prince":
+        #DP5(4)- Order 5 with embedded Order 4 (Standard RK45)
+        order = 5
+        c = np.array([0, 1/5, 3/10, 4/5, 8/9, 1, 1])
+
+        a = np.zeros((7, 7))
+        a[1, 0] = 1/5
+        a[2, 0] = 3/40;       a[2, 1] = 9/40
+        a[3, 0] = 44/45;      a[3, 1] = -56/15;    a[3, 2] = 32/9
+        a[4, 0] = 19372/6561; a[4, 1] = -25360/2187; a[4, 2] = 64448/6561; a[4, 3] = -212/729
+        a[5, 0] = 9017/3168;  a[5, 1] = -355/33;   a[5, 2] = 46732/5247; a[5, 3] = 49/176;   a[5, 4] = -5103/18656
+        a[6, 0] = 35/384;     a[6, 1] = 0;         a[6, 2] = 500/1113;   a[6, 3] = 125/192;  a[6, 4] = -2187/6784;  a[6, 5] = 11/84
+        
+        b  = np.array([35/384, 0, 500/1113, 125/192, -2187/6784, 11/84, 0])
+        bs = np.array([5179/57600, 0, 7571/16695, 393/640, -92097/339200, 187/2100, 1/40])
+        
+    return a, b, bs, c, order  
+
+
+def rk_step(f, t, y, h, a, b, bs, c):
+    # f: The physics function f(t, y)
+    # t, y: Current time and state
+    # h: The step size (dt)
+    # a, b, bs, c: The coefficients from get_tableau
+    
+    num_stages = len(c)
+    k = np.zeros((num_stages, len(y)))
+    
+    # Calculate slopes (k)
+    
+    # 3. Iterate through each stage
+    for i in range(num_stages):
+        y_stage = y + h * np.dot(a[i, :], k)
+        k[i, :] = f(t + c[i] * h, y_stage)
+        
+    # Calculate results
+    y_new = y + h * np.dot(b, k)
+
+    #Calculate error for adaptive step size
+    error = h * np.dot((b - bs), k)
+    
+    return y_new, error
+
+def solve_ode(f, t_span, y0, rtol=1e-3, atol=1e-6, method="Bogacki-Shampine"):
+    
+    t_start, t_end = t_span
+    a, b, bs, c, order = get_tableau(method)
+    
+    t = t_start
+    y = np.array(y0, dtype=float)
+    
+    # Initial step guess (conservative)
+    h = 0.1 * (t_end - t_start)
+    
+    # Output history
+    t_history = [t]
+    y_history = [y]
+    
+    while t < t_end:
+        # Don't overshoot the end time
+        if t + h > t_end:
+            h = t_end - t
+            
+        # Take a step
+        y_new, error_vector = rk_step(f, t, y, h, a, b, bs, c)
+        
+        # Industry Standard Error Check
+        scale = atol + rtol * np.maximum(np.abs(y), np.abs(y_new))
+        error_ratio = np.linalg.norm(error_vector / scale)
+        
+        # Accept or Reject?
+        if error_ratio < 1.0:
+            # --- ACCEPT STEP ---
+            t += h
+            y = y_new
+            t_history.append(t)
+            y_history.append(y)
+            
+            # Increase step size (safety factor 0.9)
+            # Avoid divide by zero if error is super small
+            if error_ratio == 0: 
+                h *= 5.0
+            else:
+                h *= 0.9 * (error_ratio ** (-1/order))
+                
+            # Cap growth to 5x
+            h = min(h, 5.0 * (t_history[-1] - t_history[-2]))
+            
+        else:
+            # --- REJECT STEP ---
+            # Shrink step size and try again
+            h *= 0.9 * (error_ratio ** (-1/order))
+            
+            # Prevent h from vanishing to zero
+            if h < 1e-15:
+                raise ValueError("Step size too small! Stiff problem?")
+
+    return np.array(t_history), np.array(y_history)
